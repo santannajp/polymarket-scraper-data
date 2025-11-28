@@ -15,11 +15,11 @@ def get_db_connection():
     """Establishes a connection to the PostgreSQL database."""
     try:
         conn = psycopg2.connect(
-            host=os.environ.get("DB_HOST"),
-            dbname=os.environ.get("DB_NAME"),
-            user=os.environ.get("DB_USER"),
-            password=os.environ.get("DB_PASSWORD"),
-            port=os.environ.get("DB_PORT"),
+            host=os.environ.get("DB_HOST", "db"),
+            dbname=os.environ.get("DB_NAME", "polymarket"),
+            user=os.environ.get("DB_USER", "admin"),
+            password=os.environ.get("DB_PASSWORD", "password"),
+            port=os.environ.get("DB_PORT", "5432"),
         )
         return conn
     except psycopg2.OperationalError as e:

@@ -33,6 +33,52 @@ services:
       timeout: 3s
       retries: 5
 
+  # The Market Discovery Worker (runs periodically)
+  market-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: poly_market_worker
+    restart: always
+    env_file: .env
+    command: >
+      bash -c "
+        echo 'Waiting for DB and Redis...' &&
+        uv run python scripts/check_setup.py &&
+        echo 'Services are up. Starting market worker loop.' &&
+        while true; do
+          uv run src/markets.py;
+          echo 'Market run finished. Waiting 1 hour...';
+          sleep 3600;
+        done
+      "
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  # The Price History Worker (runs continuously)
+  price-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: poly_price_worker
+    restart: always
+    env_file: .env
+    command: >
+      bash -c "
+        echo 'Waiting for DB and Redis...' &&
+        uv run python scripts/check_setup.py &&
+        echo 'Services are up. Starting price worker.' &&
+        uv run src/price_worker.py
+      "
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
 volumes:
   postgres_data:
   redis_data:

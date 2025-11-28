@@ -1,45 +1,57 @@
-import asyncio
 import os
-import asyncpg
-from redis import asyncio as aioredis
-from dotenv import load_dotenv
+import time
+import psycopg2
+import redis
+import logging
 
-load_dotenv()
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
+def check_postgres():
+    """Checks the PostgreSQL connection."""
+    retries = 10
+    for i in range(retries):
+        try:
+            conn = psycopg2.connect(
+                host=os.environ.get("DB_HOST", "db"),
+                dbname=os.environ.get("DB_NAME", "polymarket"),
+                user=os.environ.get("DB_USER", "admin"),
+                password=os.environ.get("DB_PASSWORD", "password"),
+                port=os.environ.get("DB_PORT", "5432"),
+                connect_timeout=3,
+            )
+            conn.close()
+            logging.info("PostgreSQL is ready.")
+            return True
+        except psycopg2.OperationalError as e:
+            logging.warning(f"PostgreSQL not ready yet (attempt {i+1}/{retries}): {e}")
+            time.sleep(5)
+    logging.error("Could not connect to PostgreSQL after several retries.")
+    return False
 
-async def check_db():
-    dsn = f"postgresql://{os.getenv('DB_USER')}:{os.getenv('DB_PASSWORD')}@{os.getenv('DB_HOST')}:{os.getenv('DB_PORT')}/{os.getenv('DB_NAME')}"
-    try:
-        conn = await asyncpg.connect(dsn)
-        version = await conn.fetchval("SELECT version()")
-        print(f"✔ Database Connected: {version}")
-
-        # Check if Timescale extension is loaded
-        timescale = await conn.fetchval(
-            "SELECT default_version FROM pg_available_extensions WHERE name = 'timescaledb'")
-        print(f"✔ TimescaleDB Extension Available: v{timescale}")
-
-        await conn.close()
-    except Exception as e:
-        print(f"❌ Database Error: {e}")
-
-
-async def check_redis():
-    try:
-        r = aioredis.from_url(f"redis://{os.getenv('REDIS_HOST')}:{os.getenv('REDIS_PORT')}")
-        await r.set("test_key", "Hello Polymarket")
-        value = await r.get("test_key")
-        print(f"✔ Redis Connected: {value.decode('utf-8')}")
-        await r.close()
-    except Exception as e:
-        print(f"❌ Redis Error: {e}")
-
-
-async def main():
-    print("--- Checking Infrastructure ---")
-    await check_db()
-    await check_redis()
-
+def check_redis():
+    """Checks the Redis connection."""
+    retries = 10
+    for i in range(retries):
+        try:
+            r = redis.Redis(
+                host=os.environ.get("REDIS_HOST"),
+                port=int(os.environ.get("REDIS_PORT")),
+                db=int(os.environ.get("REDIS_DB")),
+                socket_connect_timeout=3,
+            )
+            r.ping()
+            logging.info("Redis is ready.")
+            return True
+        except (redis.exceptions.ConnectionError, redis.exceptions.TimeoutError) as e:
+            logging.warning(f"Redis not ready yet (attempt {i+1}/{retries}): {e}")
+            time.sleep(5)
+    logging.error("Could not connect to Redis after several retries.")
+    return False
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    if check_postgres() and check_redis():
+        logging.info("All services are ready. Exiting with success.")
+        exit(0)
+    else:
+        logging.error("One or more services are not ready. Exiting with failure.")
+        exit(1)
