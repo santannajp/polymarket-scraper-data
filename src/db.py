@@ -4,6 +4,7 @@ import psycopg2
 from psycopg2.extras import Json, execute_values
 from typing import List, Dict, Any, Optional
 import logging
+from datetime import datetime, timezone
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -283,3 +284,47 @@ def link_tags_to_events(conn, events: List[Dict[str, Any]]):
         )
     conn.commit()
     logging.info(f"Linked {len(event_tag_pairs)} event-tag relationships.")
+
+def get_token_ids_for_market(conn, market_id: str) -> List[str]:
+    """Fetches all token_ids for a given market_id."""
+    with conn.cursor() as cursor:
+        cursor.execute("SELECT token_id FROM market_outcomes WHERE market_id = %s", (market_id,))
+        return [row[0] for row in cursor.fetchall()]
+
+def get_all_token_ids(conn) -> List[str]:
+    """Fetches all token_ids from the market_outcomes table."""
+    with conn.cursor() as cursor:
+        cursor.execute("SELECT token_id FROM market_outcomes")
+        return [row[0] for row in cursor.fetchall()]
+
+def insert_price_history(conn, token_id: str, price_data: List[Dict[str, Any]]):
+    """
+
+    Inserts a list of price data points into the 'price_history' table.
+    """
+    if not price_data:
+        return
+
+    records = []
+    for point in price_data:
+        ts = datetime.fromtimestamp(point['t'], tz=timezone.utc)
+        price = point['p']
+        records.append((ts, token_id, price, None, "MID"))
+
+    if not records:
+        return
+
+    with conn.cursor() as cursor:
+        execute_values(
+            cursor,
+            """
+            INSERT INTO price_history (time, token_id, price, amount, side)
+            VALUES %s
+            ON CONFLICT (token_id, time) DO NOTHING
+            """,
+            records,
+            template=None,
+            page_size=500
+        )
+    conn.commit()
+    logging.info(f"Inserted {len(records)} price points for token {token_id}.")

@@ -5,7 +5,8 @@ CREATE TABLE price_history (
     token_id TEXT NOT NULL REFERENCES market_outcomes(token_id), -- Links to "Yes" or "No"
     price NUMERIC,
     amount NUMERIC,    -- Volume of this specific trade/candle
-    side TEXT          -- 'BUY' or 'SELL' (if capturing ticks)
+    side TEXT,         -- 'BUY' or 'SELL' (if capturing ticks)
+    PRIMARY KEY (time, token_id)
 );
 
 -- Convert to Hypertable (TimescaleDB magic)

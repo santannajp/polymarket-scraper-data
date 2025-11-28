@@ -8,17 +8,21 @@ from db import (
     upsert_tags,
     link_tags_to_events,
 )
+from redis_client import get_redis_connection
 import logging
 
 def scrape_and_process_events():
     """
     Scrapes all active events, and their associated markets, from the 
-    Polymarket Gamma API and stores them in the database.
+    Polymarket Gamma API and stores them in the database. It then queues
+    the market IDs for the price worker.
     """
     client = PolymarketGammaClient()
     conn = None
+    redis_conn = None
     try:
         conn = get_db_connection()
+        redis_conn = get_redis_connection()
         offset = 0
         limit = 100
 
@@ -35,6 +39,7 @@ def scrape_and_process_events():
             # Upsert the batch of events
             upsert_events(conn, events_response)
             
+            all_market_ids = []
             # Process each event individually for its nested data
             for event in events_response:
                 event_id = event.get('id')
@@ -46,20 +51,19 @@ def scrape_and_process_events():
                 markets = event.get('markets', [])
                 if markets:
                     upsert_markets(conn, markets, event_id=event_id)
-                    # Outcomes are nested in markets, so we process them here
                     upsert_market_outcomes(conn, markets)
+                    all_market_ids.extend([m['id'] for m in markets if m.get('id')])
 
                 # Tags are also nested within the event object
                 tags = event.get('tags', [])
                 if tags:
-                    # We can pass the single event to the tag functions
                     upsert_tags(conn, [event])
                     link_tags_to_events(conn, [event])
 
-            # TODO: Send market_ids to Redis Queue for Price Worker
-            # all_market_ids = [m['id'] for e in events_response for m in e.get('markets', [])]
-            # if all_market_ids:
-            #     send_to_redis_queue(all_market_ids)
+            # Send market_ids to Redis Queue for Price Worker
+            if all_market_ids:
+                logging.info(f"Queueing {len(all_market_ids)} market IDs for the price worker.")
+                redis_conn.lpush("price_worker_queue", *all_market_ids)
 
             offset += limit
             time.sleep(0.5)  # Be nice to the API
@@ -70,7 +74,9 @@ def scrape_and_process_events():
         if conn:
             conn.close()
             logging.info("Database connection closed.")
+        # Redis connection does not need explicit closing with recent library versions
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
     scrape_and_process_events()
+
