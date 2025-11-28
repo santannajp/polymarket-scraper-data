@@ -2,6 +2,7 @@ import requests
 from typing import List, Dict, Any, Optional
 from urllib.parse import urljoin
 import time
+import json
 
 
 class PolymarketGammaClient:
@@ -120,7 +121,8 @@ if __name__ == "__main__":
         print("-" * 30)
 
     print("\n--- Fetching Events (aggregated markets) ---")
-    events = client.get_events(limit=3, active=True)
+    events = client.get_events(limit=1, active=True)
     for e in events:
         print(f"Event: {e.get('title')}")
         print(f"Markets Count: {len(e.get('markets', []))}")
+        print(json.dumps(e, indent=2))

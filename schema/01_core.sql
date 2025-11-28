@@ -12,7 +12,6 @@ CREATE TABLE events (
     icon_url TEXT,
     active BOOLEAN,
     is_restricted BOOLEAN,             -- "restricted": true
-    cyom BOOLEAN,                      -- "Create Your Own Market"
     raw_data JSONB,                    -- Store full root JSON here for safety
     updated_at TIMESTAMPTZ DEFAULT NOW()
 );
@@ -22,10 +21,17 @@ CREATE TABLE markets (
     id TEXT PRIMARY KEY,               -- 'markets[].id' (e.g., "516706")
     event_id TEXT REFERENCES events(id),
     condition_id TEXT UNIQUE,          -- '0x431...' (Vital for blockchain lookups)
-    question_id TEXT,                  -- '0x842...'
+    question_id TEXT,                  -- '0x842...
+
     question TEXT,
-    resolution_source TEXT,            -- Often a URL or text
-    market_maker_address TEXT,
+    description TEXT,
+
+    created_at_date TIMESTAMPTZ,
+    start_date TIMESTAMPTZ,
+    end_date TIMESTAMPTZ,
+    accepting_orders_date TIMESTAMPTZ,
+
+    competitive FLOAT,
 
     -- Status flags
     active BOOLEAN,
@@ -48,12 +54,7 @@ CREATE TABLE market_outcomes (
     token_id TEXT PRIMARY KEY,         -- From 'clobTokenIds' (The long numeric string)
     market_id TEXT REFERENCES markets(id),
     outcome_label TEXT,                -- "Yes", "No", "Trump", "Biden"
-    outcome_index INT,                 -- 0 for Yes, 1 for No (helps maintain order)
-
-    -- Current snapshot stats (updated frequently, queried often)
-    current_price NUMERIC,             -- From 'lastTradePrice' or 'outcomePrices'
-    best_bid NUMERIC,
-    best_ask NUMERIC
+    outcome_index INT                  -- 0 for Yes, 1 for No (helps maintain order)
 );
 
 CREATE TABLE tags (
