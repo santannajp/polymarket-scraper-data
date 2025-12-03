@@ -1,222 +1,146 @@
-Building a scraper for a prediction market like Polymarket requires handling two distinct types of data: **Relational Metadata** (Market details) and **Time-Series Data** (Price history).
-Here is the detailed architecture breakdown.
+# Polymarket Scraper
 
----
+This project is a Python-based scraper for the Polymarket prediction market platform. It fetches data from the Polymarket APIs, processes it, and stores it in a PostgreSQL database with the TimescaleDB extension for efficient time-series data handling.
 
-### 1. The Data Classification
-Before choosing tools, we must understand how the data behaves:
+## Features
 
-1.  **Market Metadata (Low Velocity, High Complexity):**
-    *   *Data:* Title, description, categories, resolution dates, icon URLs.
-    *   *Behavior:* Updates rarely. Requires complex filtering (e.g., "Find all Sports markets ending in 2025").
-    *   *Storage:* Standard Relational Tables (PostgreSQL).
-2.  **Price & Volume History (High Velocity, Append-Only):**
-    *   *Data:* Price of "Yes" at 10:00 AM, Volume at 10:05 AM.
-    *   *Behavior:* Massive volume of writes. Queries are usually aggregations (e.g., "OHLC candles").
-    *   *Storage:* Time-Series Hypertable (TimescaleDB).
+- Scrapes market and event data from the Polymarket Gamma API.
+- Scrapes price history data from the Polymarket CLOB API.
+- Stores data in a PostgreSQL + TimescaleDB database.
+- Uses Redis as a message queue to decouple market discovery and price scraping.
+- Containerized with Docker and Docker Compose for easy setup and deployment.
 
-### 2. The Database Architecture (PostgreSQL + TimescaleDB)
+## Technology Stack
 
-Why this stack?
-*   **Unified SQL:** You can join your price history with market metadata in a single query.
-*   **Compression:** TimescaleDB compresses historical price data by 90%+, saving massive disk space.
-*   **JSON Support:** Postgres has native JSONB support for storing raw API responses that might change structure.
+- **Python 3.11**
+- **PostgreSQL 16** with **TimescaleDB**
+- **Redis**
+- **Docker** & **Docker Compose**
+- `psycopg2` for PostgreSQL connection.
+- `redis-py` for Redis connection.
+- `py-clob-client` for Polymarket CLOB API.
+- `requests` for Polymarket Gamma API.
 
-#### The Schema Design
+## Project Structure
 
-#### 1. Core Metadata Tables (Relational)
-
-These tables store the "Facts" about the markets.
-
-```sql
--- 1. EVENTS: The high-level grouping (e.g., "Fed Rates")
-CREATE TABLE events (
-    id TEXT PRIMARY KEY,               -- Root 'id' (e.g., "16084")
-    ticker TEXT,                       -- "fed-rate-hike-in-2025"
-    slug TEXT,
-    title TEXT,
-    description TEXT,
-    start_date TIMESTAMPTZ,
-    end_date TIMESTAMPTZ,
-    creation_date TIMESTAMPTZ,
-    image_url TEXT,
-    icon_url TEXT,
-    active BOOLEAN,
-    is_restricted BOOLEAN,             -- "restricted": true
-    cyom BOOLEAN,                      -- "Create Your Own Market"
-    raw_data JSONB,                    -- Store full root JSON here for safety
-    updated_at TIMESTAMPTZ DEFAULT NOW()
-);
-
--- 2. MARKETS: The specific tradeable questions
-CREATE TABLE markets (
-    id TEXT PRIMARY KEY,               -- 'markets[].id' (e.g., "516706")
-    event_id TEXT REFERENCES events(id),
-    condition_id TEXT UNIQUE,          -- '0x431...' (Vital for blockchain lookups)
-    question_id TEXT,                  -- '0x842...'
-    question TEXT,
-    resolution_source TEXT,            -- Often a URL or text
-    market_maker_address TEXT,
-    
-    -- Status flags
-    active BOOLEAN,
-    closed BOOLEAN,
-    archived BOOLEAN,
-    accepting_orders BOOLEAN,
-    
-    -- Configurations
-    uma_bond NUMERIC,
-    order_min_size NUMERIC,
-    order_price_min_tick_size NUMERIC,
-    
-    raw_data JSONB,                    -- Store the specific object from the markets array
-    updated_at TIMESTAMPTZ DEFAULT NOW()
-);
-
--- 3. MARKET OUTCOMES (Linking Tokens to Labels)
--- This "unzips" the 'clobTokenIds' and 'outcomes' arrays.
-CREATE TABLE market_outcomes (
-    token_id TEXT PRIMARY KEY,         -- From 'clobTokenIds' (The long numeric string)
-    market_id TEXT REFERENCES markets(id),
-    outcome_label TEXT,                -- "Yes", "No", "Trump", "Biden"
-    outcome_index INT,                 -- 0 for Yes, 1 for No (helps maintain order)
-    
-    -- Current snapshot stats (updated frequently, queried often)
-    current_price NUMERIC,             -- From 'lastTradePrice' or 'outcomePrices'
-    best_bid NUMERIC,
-    best_ask NUMERIC
-);
-
--- Indexes for frequent filtering
-CREATE INDEX idx_events_active ON events(active);
-CREATE INDEX idx_markets_condition ON markets(condition_id);
-CREATE INDEX idx_outcomes_market ON market_outcomes(market_id);
+```
+/
+├── data/                     # Data volumes for Postgres and Redis
+├── schema/                   # Database schema files
+│   ├── 01_core.sql           # Core relational tables
+│   └── 02_time_series.sql    # Time-series hypertables
+├── scripts/                  # Utility scripts
+│   ├── check_setup.py        # Checks DB and Redis connections
+│   └── init_db.py            # Initializes the database schema
+├── src/                      # Main application source code
+│   ├── clob_api.py           # CLOB API client
+│   ├── constants.py          # Project constants
+│   ├── db.py                 # Database interaction logic
+│   ├── gamma_api.py          # Gamma API client
+│   ├── markets.py            # Market discovery worker
+│   ├── price_worker.py       # Price history worker
+│   └── redis_client.py       # Redis client
+├── .env.example              # Example environment variables
+├── docker-compose.yml        # Docker Compose configuration
+├── Dockerfile                # Dockerfile for Python workers
+└── README.md                 # This file
 ```
 
-#### 2. Tagging System (Normalized)
+## How It Works
 
-The JSON contains a list of tags. Normalizing this allows you to query "All Business markets".
+The application consists of two main services that run as workers:
 
-```sql
-CREATE TABLE tags (
-    id TEXT PRIMARY KEY, -- "100196"
-    slug TEXT UNIQUE,    -- "fed-rates"
-    label TEXT           -- "Fed Rates"
-);
+1.  **Market Worker (`market-worker`)**:
+    - Runs periodically (every 1 hour by default).
+    - Fetches active events and their associated markets from the Polymarket Gamma API.
+    - Upserts event, market, tag, and outcome data into the PostgreSQL database.
+    - Pushes the ID of each discovered market into a Redis queue (`price_worker_queue`).
 
-CREATE TABLE event_tags (
-    event_id TEXT REFERENCES events(id),
-    tag_id TEXT REFERENCES tags(id),
-    PRIMARY KEY (event_id, tag_id)
-);
+2.  **Price Worker (`price-worker`)**:
+    - Runs continuously.
+    - Listens for market IDs on the Redis queue.
+    - For each market ID, it fetches the corresponding token IDs from the database.
+    - For each token ID, it scrapes the full price history from the CLOB API.
+    - Inserts the price history data into the `price_history` hypertable in the database.
+
+## Getting Started
+
+### Prerequisites
+
+- Docker
+- Docker Compose
+
+### Setup
+
+1.  **Clone the repository:**
+    ```bash
+    git clone https://github.com/your-username/polymarket-scraper.git
+    cd polymarket-scraper
+    ```
+
+2.  **Create an environment file:**
+    - Copy the example environment file:
+      ```bash
+      cp .env.example .env
+      ```
+    - (Optional) Modify the variables in `.env` if you want to change the default database credentials or ports.
+
+3.  **Build and run the services:**
+    ```bash
+    docker-compose up --build
+    ```
+    This command will:
+    - Build the Docker image for the Python workers.
+    - Start the PostgreSQL database (`db`).
+    - Start the Redis server (`redis`).
+    - Start the market discovery worker (`market-worker`).
+    - Start the price history worker (`price-worker`).
+
+4.  **Initialize the database schema:**
+    - In a separate terminal, wait for the `db` service to be healthy. You can check the logs with `docker-compose logs -f db`.
+    - Once the database is ready, run the initialization script:
+      ```bash
+      docker-compose exec market-worker uv run python scripts/init_db.py
+      ```
+    - This will create all the necessary tables and hypertables defined in the `schema/` directory.
+
+The scrapers will now be running. You can monitor their activity by viewing the logs:
+```bash
+# View logs for all services
+docker-compose logs -f
+
+# View logs for a specific service
+docker-compose logs -f market-worker
+docker-compose logs -f price-worker
 ```
 
-#### 3. Time-Series Data (TimescaleDB)
+### Accessing the Data
 
-This is where the massive data volume lives. We separate "Trade History" from "Market Stats History".
+You can connect to the PostgreSQL database to query the scraped data:
+- **Host**: `localhost` (or your Docker host IP)
+- **Port**: `5432` (or as configured in `.env`)
+- **Database**: `polymarket`
+- **User**: `admin`
+- **Password**: `password`
 
+Use any standard SQL client (like `psql`, DBeaver, or DataGrip) to connect.
+
+### Example Queries
+
+**Find the most recently updated active markets:**
 ```sql
--- 4. PRICE HISTORY (OHLCV or Ticks)
--- Stores the price movement of specific outcome tokens (Yes/No)
-CREATE TABLE price_history (
-    time TIMESTAMPTZ NOT NULL,
-    token_id TEXT NOT NULL REFERENCES market_outcomes(token_id), -- Links to "Yes" or "No"
-    price NUMERIC,
-    amount NUMERIC,    -- Volume of this specific trade/candle
-    side TEXT          -- 'BUY' or 'SELL' (if capturing ticks)
-);
-
--- Convert to Hypertable (TimescaleDB magic)
-SELECT create_hypertable('price_history', 'time');
-
-
--- 5. MARKET STATS HISTORY
--- Tracks the liquidity and volume growth of the market as a whole over time
-CREATE TABLE market_stats_history (
-    time TIMESTAMPTZ NOT NULL,
-    market_id TEXT NOT NULL REFERENCES markets(id),
-    liquidity_clob NUMERIC,
-    volume_24hr NUMERIC,
-    volume_total NUMERIC,
-    open_interest NUMERIC
-);
-
-SELECT create_hypertable('market_stats_history', 'time');
-```
-
-
-### 3. The Scraper Architecture (Python-based)
-
-You cannot simply loop through all markets sequentially; it will be too slow. You need an asynchronous pipeline.
-
-**Tech Stack:** Python, Aiohttp (Async requests), Celery (Task Queue), Redis (Broker).
-
-#### Component 1: The Discovery Worker (The "Manager")
-*   **Frequency:** Runs every 1-5 minutes.
-*   **Job:** Hits the Polymarket Gamma API (`/events` or `/markets`).
-*   **Logic:**
-    1.  Fetches list of active markets.
-    2.  Upserts metadata into the `markets` table.
-    3.  Detects new markets.
-    4.  **Crucial:** Pushes a job to the Queue for price updates.
-
-#### Component 2: The Price Worker (The "Grunt")
-*   **Trigger:** Triggered by the Discovery Worker.
-*   **Job:** Fetches price history (candles) or Order Book data.
-*   **Logic:**
-    1.  Receives `market_id` from Queue.
-    2.  Hits the CLOB (Central Limit Order Book) API for the latest tick/candle.
-    3.  Batches data.
-    4.  Performs a bulk insert (`COPY`) into the `price_history` table.
-
-#### Component 3: The Snapshot Worker (Top Holders)
-*   **Frequency:** Runs less often (e.g., every 6 hours) as holder data changes slower.
-*   **Job:** Queries the leaderboard/holders endpoint.
-*   **Logic:** Replaces or updates entries in the `positions` table.
-
----
-
-### 4. Handling API Limitations & Optimization
-
-Polymarket (and the underlying blockchain RPCs) have rate limits.
-
-1.  **Proxy Rotation:** If you scrape aggressively, you will need a proxy service.
-2.  **CLOB vs. Gamma API:**
-    *   Use **Gamma API** for metadata (Descriptions, Images).
-    *   Use **CLOB API** for Prices. It is faster and geared towards trading bots.
-3.  **ETags / Caching:** In your `markets` table, store a `last_updated` timestamp. Only scrape deep data for markets that have activity.
-
----
-
-### 5. Example Query Capabilities
-
-With this architecture, you can run powerful analytical queries:
-
-**Query: Get the price history of "Yes" for all "Sports" markets:**
-```sql
-SELECT time_bucket('1 hour', p.time) as bucket,
-       m.question,
-       avg(p.price)
-FROM price_history p
-JOIN tokens t ON p.token_id = t.token_id
-JOIN markets m ON t.market_id = m.id
-WHERE m.category = 'Sports'
-GROUP BY bucket, m.question;
-```
-
-**Query: Find "Whales" (Top holders across multiple markets):**
-```sql
-SELECT user_address, sum(value_usdc) as total_exposure
-FROM positions
-GROUP BY user_address
-ORDER BY total_exposure DESC
+SELECT question, updated_at
+FROM markets
+WHERE active = TRUE
+ORDER BY updated_at DESC
 LIMIT 10;
 ```
 
-### 6. Summary of Recommended Stack
-
-1.  **Language:** Python 3.11+ (Type hinting is helpful for complex data).
-2.  **Scraping Libs:** `httpx` (Async HTTP), `tenacity` (Retrying failed requests).
-3.  **Database:** PostgreSQL 16 + TimescaleDB extension.
-4.  **Queue:** Redis (Keep it simple, no need for RabbitMQ yet).
-5.  **Containerization:** Docker Compose (to spin up Python, Postgres, and Redis together).
+**Get the latest price for a specific outcome token:**
+```sql
+SELECT price
+FROM price_history
+WHERE token_id = '<your_token_id>'
+ORDER BY time DESC
+LIMIT 1;
+```
