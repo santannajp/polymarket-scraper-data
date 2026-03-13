@@ -1,0 +1,39 @@
+# Version control
+.git/
+.gitignore
+
+# Python caches
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Virtual environments (local, not the one uv creates inside the image)
+.venv/
+venv/
+env/
+scraper/
+
+# Local data and model outputs (generated at runtime)
+data/
+models/
+reports/
+
+# Tests (not needed at runtime in the image)
+tests/
+
+# Development and CI tooling
+.claude/
+.ruff_cache/
+.mypy_cache/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Local environment secrets
+.env
+
+# IDE
+.idea/
+.vscode/

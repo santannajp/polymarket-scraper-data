@@ -1,5 +1,6 @@
 services:
-  # The Database: PostgreSQL + TimescaleDB
+  # ─── Infrastructure ────────────────────────────────────────────────────────
+
   db:
     image: timescale/timescaledb:latest-pg16
     container_name: poly_db
@@ -13,12 +14,11 @@ services:
     volumes:
       - ./data/postgres:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U admin -d polymarket"]
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-admin} -d ${DB_NAME:-polymarket}"]
       interval: 5s
       timeout: 5s
-      retries: 5
+      retries: 10
 
-  # The Queue Broker: Redis
   redis:
     image: redis:alpine
     container_name: poly_redis
@@ -33,7 +33,36 @@ services:
       timeout: 3s
       retries: 5
 
-  # The Market Discovery Worker (runs periodically)
+  # ─── Schema initializer (runs once on first boot) ──────────────────────────
+  # Applies all SQL migrations in order: 01_core, 02_time_series, 03_resolution.
+  # Uses `restart: on-failure` so it retries if the DB isn't fully ready yet,
+  # and stops once it exits 0 (success). Workers depend on this completing.
+
+  db-init:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: poly_db_init
+    restart: on-failure
+    env_file: .env
+    command: >
+      bash -c "
+        echo 'Waiting for DB and Redis to be ready...' &&
+        uv run python scripts/check_setup.py &&
+        echo 'Running schema migrations...' &&
+        uv run python scripts/init_db.py &&
+        echo 'Schema migrations complete.'
+      "
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  # ─── Active market scraper (every hour) ────────────────────────────────────
+  # Fetches active events from Gamma API, upserts to DB, and pushes token_ids
+  # to Redis queue so price-worker can fetch price history.
+
   market-worker:
     build:
       context: .
@@ -43,22 +72,23 @@ services:
     env_file: .env
     command: >
       bash -c "
-        echo 'Waiting for DB and Redis...' &&
         uv run python scripts/check_setup.py &&
-        echo 'Services are up. Starting market worker loop.' &&
+        echo 'Starting market worker loop.' &&
         while true; do
-          uv run src/markets.py;
-          echo 'Market run finished. Waiting 1 hour...';
+          uv run python src/markets.py;
+          echo 'Market run done. Sleeping 1h...';
           sleep 3600;
         done
       "
     depends_on:
-      db:
-        condition: service_healthy
+      db-init:
+        condition: service_completed_successfully
       redis:
         condition: service_healthy
 
-  # The Price History Worker (runs continuously)
+  # ─── Price history consumer (continuous) ───────────────────────────────────
+  # Reads token_ids from Redis queue and fetches MID price history via CLOB API.
+
   price-worker:
     build:
       context: .
@@ -68,17 +98,70 @@ services:
     env_file: .env
     command: >
       bash -c "
-        echo 'Waiting for DB and Redis...' &&
         uv run python scripts/check_setup.py &&
-        echo 'Services are up. Starting price worker.' &&
-        uv run src/price_worker.py
+        echo 'Starting price worker.' &&
+        uv run python src/price_worker.py
       "
     depends_on:
-      db:
-        condition: service_healthy
+      db-init:
+        condition: service_completed_successfully
       redis:
         condition: service_healthy
 
-volumes:
-  postgres_data:
-  redis_data:
+  # ─── Historical resolved-market collector (one-time full scan + incremental) ─
+  # Phase 1: full scan of ~546K resolved markets (checkpoint-aware, resumes after crash).
+  # Phase 2: incremental scan every 6h for newly resolved markets.
+  # token_ids are pushed to Redis so price-worker fetches their price history.
+
+  historical-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: poly_historical_worker
+    restart: on-failure
+    env_file: .env
+    command: >
+      bash -c "
+        uv run python scripts/check_setup.py &&
+        echo 'Starting historical full scan (checkpoint-aware)...' &&
+        uv run python src/historical_worker.py --mode full &&
+        echo 'Full scan complete. Switching to incremental mode (every 6h).' &&
+        while true; do
+          uv run python src/historical_worker.py --mode incremental --lookback-days 1;
+          echo 'Incremental run done. Sleeping 6h...';
+          sleep 21600;
+        done
+      "
+    depends_on:
+      db-init:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+
+  # ─── Orderbook bid/ask snapshot worker (every 15 min) ─────────────────────
+  # Captures live best bid/ask for all active tokens via CLOB API.
+  # Inserts SNAPSHOT rows into price_history with bid/ask populated.
+  # Required for real spread_width features and backtester cost calculations.
+
+  orderbook-snapshot-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: poly_orderbook_snapshot_worker
+    restart: always
+    env_file: .env
+    environment:
+      SNAPSHOT_INTERVAL_SECONDS: "900"   # 15 minutes
+      SNAPSHOT_BATCH_SIZE: "50"
+      SNAPSHOT_INTER_BATCH_SLEEP: "0.2"
+    command: >
+      bash -c "
+        uv run python scripts/check_setup.py &&
+        echo 'Starting orderbook snapshot worker.' &&
+        uv run python src/orderbook_snapshot_worker.py
+      "
+    depends_on:
+      db-init:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
