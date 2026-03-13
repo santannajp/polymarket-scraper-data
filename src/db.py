@@ -34,13 +34,18 @@ def _flatten_event(event: Dict[str, Any]) -> Dict[str, Any]:
         "slug": event.get("slug"),
         "title": event.get("title"),
         "description": event.get("description"),
-        "start_date": event.get("start_date"),
-        "end_date": event.get("end_date"),
-        "creation_date": event.get("creation_date"),
+        "start_date": event.get("startDate"),
+        "end_date": event.get("endDate"),
+        "creation_date": event.get("creationDate"),
         "image_url": event.get("image"),
         "icon_url": event.get("icon"),
         "active": event.get("active"),
         "is_restricted": event.get("restricted"),
+        # category is a plain string at the root of the event object
+        "category": event.get("category"),
+        # liquidity and volume are numeric at the root of the event object
+        "liquidity": event.get("liquidity"),
+        "volume": event.get("volume"),
         "raw_data": Json(event),
     }
 
@@ -108,6 +113,14 @@ def _flatten_market(market: Dict[str, Any], event_id: str) -> Dict[str, Any]:
         "resolved_at": market.get("closedTime"),
         "winner_token_id": None,           # set later via update_market_resolution()
         "uma_resolution_status": market.get("umaResolutionStatus"),
+        # New fields (Migration 04)
+        # slug and category are plain strings in the market object
+        "slug": market.get("slug"),
+        "category": market.get("category"),
+        # "liquidity" and "volume" are returned as strings by Gamma API;
+        # use the numeric counterparts to avoid NaN on cast.
+        "liquidity": market.get("liquidityNum"),
+        "volume": market.get("volumeNum"),
         "raw_data": Json(market),
     }
 
