@@ -104,6 +104,10 @@ def _flatten_market(market: Dict[str, Any], event_id: str) -> Dict[str, Any]:
         "uma_bond": market.get("umaBond"),
         "order_min_size": market.get("orderMinSize"),
         "order_price_min_tick_size": market.get("orderPriceMinTickSize"),
+        # Resolution fields (Etapa 1)
+        "resolved_at": market.get("closedTime"),
+        "winner_token_id": None,           # set later via update_market_resolution()
+        "uma_resolution_status": market.get("umaResolutionStatus"),
         "raw_data": Json(market),
     }
 
@@ -297,10 +301,41 @@ def get_all_token_ids(conn) -> List[str]:
         cursor.execute("SELECT token_id FROM market_outcomes")
         return [row[0] for row in cursor.fetchall()]
 
-def insert_price_history(conn, token_id: str, price_data: List[Dict[str, Any]]):
+def get_active_token_ids(conn) -> List[str]:
     """
+    Fetches token_ids for all outcomes belonging to currently active, non-closed markets.
 
+    Used by the orderbook_snapshot_worker to determine which tokens need bid/ask snapshots.
+    """
+    with conn.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT mo.token_id
+            FROM market_outcomes mo
+            JOIN markets m ON mo.market_id = m.id
+            WHERE m.active = true AND m.closed = false
+            """
+        )
+        return [row[0] for row in cursor.fetchall()]
+
+def insert_price_history(
+    conn,
+    token_id: str,
+    price_data: List[Dict[str, Any]],
+    bid: Optional[float] = None,
+    ask: Optional[float] = None,
+    side: str = "MID",
+):
+    """
     Inserts a list of price data points into the 'price_history' table.
+
+    Args:
+        conn: Active psycopg2 connection.
+        token_id: The CLOB token identifier.
+        price_data: List of dicts with keys 't' (unix timestamp) and 'p' (price).
+        bid: Optional best-bid price to store alongside each record (Etapa 1).
+        ask: Optional best-ask price to store alongside each record (Etapa 1).
+        side: Record type — 'MID' for historical series, 'SNAPSHOT' for live bid/ask captures.
     """
     if not price_data:
         return
@@ -309,7 +344,7 @@ def insert_price_history(conn, token_id: str, price_data: List[Dict[str, Any]]):
     for point in price_data:
         ts = datetime.fromtimestamp(point['t'], tz=timezone.utc)
         price = point['p']
-        records.append((ts, token_id, price, None, "MID"))
+        records.append((ts, token_id, price, None, side, bid, ask))
 
     if not records:
         return
@@ -318,7 +353,7 @@ def insert_price_history(conn, token_id: str, price_data: List[Dict[str, Any]]):
         execute_values(
             cursor,
             """
-            INSERT INTO price_history (time, token_id, price, amount, side)
+            INSERT INTO price_history (time, token_id, price, amount, side, bid, ask)
             VALUES %s
             ON CONFLICT (token_id, time) DO NOTHING
             """,
@@ -328,3 +363,43 @@ def insert_price_history(conn, token_id: str, price_data: List[Dict[str, Any]]):
         )
     conn.commit()
     logging.info(f"Inserted {len(records)} price points for token {token_id}.")
+
+
+def update_market_resolution(
+    conn,
+    market_id: str,
+    winner_token_id: Optional[str],
+    resolved_at: Optional[str],
+    uma_resolution_status: Optional[str],
+) -> None:
+    """
+    Updates the resolution fields of a market after its outcomes have been upserted.
+
+    This is a separate UPDATE (not part of upsert_markets) because winner_token_id
+    is derived from market_outcomes data that is inserted after the market row itself.
+
+    Args:
+        conn: Active psycopg2 connection.
+        market_id: The market primary key.
+        winner_token_id: token_id of the winning outcome, or None if ambiguous/unresolved.
+        resolved_at: ISO timestamp string from the API's 'closedTime' field.
+        uma_resolution_status: Value from the API's 'umaResolutionStatus' field.
+    """
+    with conn.cursor() as cursor:
+        cursor.execute(
+            """
+            UPDATE markets
+            SET
+                winner_token_id       = %s,
+                resolved_at           = %s,
+                uma_resolution_status = %s,
+                updated_at            = NOW()
+            WHERE id = %s
+            """,
+            (winner_token_id, resolved_at, uma_resolution_status, market_id),
+        )
+    conn.commit()
+    logging.info(
+        f"Updated resolution for market {market_id}: winner={winner_token_id}, "
+        f"status={uma_resolution_status}"
+    )
